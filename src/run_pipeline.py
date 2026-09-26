@@ -1,76 +1,75 @@
 """End-to-end pipeline: train -> tune threshold -> predict on test -> validate.
 
+MEMORY DESIGN: this pipeline never loads the full train or test dataset into
+memory at once. It first partitions each huge TSV by country on disk (via
+chunked/streaming reads, src/partition.py), then processes ONE COUNTRY AT A
+TIME -- loading, normalizing, blocking, and feature-computing just that
+country's (much smaller) slice before discarding it and moving to the next.
+This is what makes a multi-million-row dataset feasible on a 16GB machine.
+
 Run as:
     python -m src.run_pipeline --train-dir dataset/train --test-dir dataset/test --output-dir output
+
+Or split into two separate process runs (extra safety -- e.g. so a crash
+during prediction doesn't require re-training):
+    python -m src.run_pipeline --phase train   --train-dir dataset/train --output-dir output
+    python -m src.run_pipeline --phase predict --test-dir dataset/test --output-dir output
 """
 from __future__ import annotations
 
+import gc
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
 import joblib
 import pandas as pd
-from joblib import Parallel, delayed
 
-from . import blocking, evaluation, io_utils, model as model_mod, predict
+from . import blocking, evaluation, io_utils, model as model_mod, partition, predict
 from .config import Config, build_arg_parser, config_from_args
-from .features import fit_feature_transformers
+from .features import compute_features_parallel, fit_feature_transformers
+from . import normalization as norm
 
 
 def log(msg: str):
     print(f"[run_pipeline] {msg}", flush=True)
 
 
-def generate_candidates_all_countries(
-    s1_norm: pd.DataFrame, s2_norm: pd.DataFrame, s3_norm: pd.DataFrame, cfg: Config
-) -> Dict[str, List[str]]:
-    """Country-partitioned candidate generation, unioned back together.
+# --------------------------------------------------------------------------
+# Lightweight streaming pass: fit TF-IDF/IDF transformers on TRAIN data only,
+# without ever holding full normalized dataframes for every country at once.
+# --------------------------------------------------------------------------
+def fit_transformers_streaming(country_dirs: List[Path]) -> "object":
+    name_parts, addr_parts = [], []
+    for cdir in country_dirs:
+        for fname in ("train_source1.tsv", "train_source2.tsv", "train_source3.tsv"):
+            fpath = cdir / fname
+            if not fpath.exists():
+                continue
+            df = pd.read_csv(
+                fpath, sep="\t", dtype=str, keep_default_na=False,
+                usecols=["business_name", "business_address"],
+            )
+            name_parts.append(df["business_name"].map(norm.normalize_name))
+            addr_parts.append(df["business_address"].map(norm.normalize_address))
+            del df
+        gc.collect()
 
-    Country partitioning is a blocking optimization only (verified on the
-    training ground truth: matches never cross countries). Every country
-    present in the data is processed -- none are skipped or hard-coded.
-    """
-    countries = sorted(set(s1_norm["country"]).union(s2_norm["country"]).union(s3_norm["country"]))
-
-    def _one_country(country):
-        s1_c = s1_norm[s1_norm["country"] == country]
-        s2_c = s2_norm[s2_norm["country"] == country]
-        s3_c = s3_norm[s3_norm["country"] == country]
-        if s1_c.empty:
-            empty = pd.DataFrame(columns=["s1_id", "other_id"])
-            return country, empty, empty, len(s1_c), len(s2_c), len(s3_c)
-        pairs_s2 = blocking.generate_candidates_for_country(s1_c, s2_c, cfg) if not s2_c.empty else pd.DataFrame(columns=["s1_id", "other_id"])
-        pairs_s3 = blocking.generate_candidates_for_country(s1_c, s3_c, cfg) if not s3_c.empty else pd.DataFrame(columns=["s1_id", "other_id"])
-        return country, pairs_s2, pairs_s3, len(s1_c), len(s2_c), len(s3_c)
-
-    # Each country partition is independent -> safe to run across processes.
-    results = Parallel(n_jobs=cfg.n_jobs, backend="loky")(
-        delayed(_one_country)(c) for c in countries
-    )
-
-    all_pairs_s2, all_pairs_s3 = [], []
-    for country, pairs_s2, pairs_s3, n1, n2, n3 in results:
-        all_pairs_s2.append(pairs_s2)
-        all_pairs_s3.append(pairs_s3)
-        log(f"  country={country!r}: s1={n1} s2={n2} s3={n3} "
-            f"-> raw pairs s2={len(pairs_s2)} s3={len(pairs_s3)}")
-
-    pairs_s2_df = pd.concat(all_pairs_s2, ignore_index=True) if all_pairs_s2 else pd.DataFrame(columns=["s1_id", "other_id"])
-    pairs_s3_df = pd.concat(all_pairs_s3, ignore_index=True) if all_pairs_s3 else pd.DataFrame(columns=["s1_id", "other_id"])
-
-    candidates = blocking.cap_candidates_per_s1(
-        pairs_s2_df, pairs_s3_df, s1_norm, s2_norm, s3_norm, cfg.max_candidates
-    )
-    return candidates
+    corpus = pd.DataFrame({
+        "name_norm": pd.concat(name_parts, ignore_index=True),
+        "addr_norm": pd.concat(addr_parts, ignore_index=True),
+    })
+    del name_parts, addr_parts
+    transformers = fit_feature_transformers(corpus)
+    del corpus
+    gc.collect()
+    return transformers
 
 
-def validate_outputs(
-    matching_path: Path, candidate_path: Path, test_source1_ids: List[str]
-):
+def validate_outputs(matching_path: Path, candidate_path: Path, test_source1_ids: List[str]):
     """Lightweight internal validation of the required invariants."""
     errors = []
     mr = pd.read_csv(matching_path, sep="\t", dtype=str, keep_default_na=False)
@@ -111,146 +110,230 @@ def validate_outputs(
     log("Internal validation passed: ids unique/complete, all matches in candidate set.")
 
 
-def main(argv=None):
-    t0 = time.time()
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-    cfg = config_from_args(args)
+def _country_candidates(s1n, s2n, s3n, cfg) -> Dict[str, List[str]]:
+    """Blocking + capping for ONE already-loaded country partition."""
+    pairs_s2 = blocking.generate_candidates_for_country(s1n, s2n, cfg) if not s2n.empty else pd.DataFrame(columns=["s1_id", "other_id"])
+    pairs_s3 = blocking.generate_candidates_for_country(s1n, s3n, cfg) if not s3n.empty else pd.DataFrame(columns=["s1_id", "other_id"])
+    log(f"    raw pairs s2={len(pairs_s2)} s3={len(pairs_s3)}")
+    candidates = blocking.cap_candidates_per_s1(pairs_s2, pairs_s3, s1n, s2n, s3n, cfg.max_candidates)
+    del pairs_s2, pairs_s3
+    return candidates
 
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    cfg.models_dir.mkdir(parents=True, exist_ok=True)
-    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------------- Load ----------------
-    log("Loading training data...")
-    s1_train = io_utils.load_records(cfg.train_dir / "train_source1.tsv", "S1-")
-    s2_train = io_utils.load_records(cfg.train_dir / "train_source2.tsv", "S2-")
-    s3_train = io_utils.load_records(cfg.train_dir / "train_source3.tsv", "S3-")
-    ground_truth = io_utils.load_ground_truth(cfg.train_dir / "train_ground_truth.tsv")
-    log(f"  source1={len(s1_train)} source2={len(s2_train)} source3={len(s3_train)} gt_rows={len(ground_truth)}")
+# --------------------------------------------------------------------------
+# TRAIN PHASE -- processes one country at a time, never holding the full
+# train dataset in memory.
+# --------------------------------------------------------------------------
+def run_train_phase(cfg: Config) -> dict:
+    log("=== TRAIN PHASE ===")
+    log("Partitioning training data by country (streamed, cached on disk)...")
+    partition.partition_train_dir(cfg.train_dir, cfg.partitioned_train_dir, force=cfg.force_repartition)
+    country_dirs = partition.list_country_dirs(cfg.partitioned_train_dir)
+    log(f"  countries found: {[d.name for d in country_dirs]}")
 
-    log("Loading test data...")
-    s1_test = io_utils.load_records(cfg.test_dir / "test_source1.tsv", "S1-")
-    s2_test = io_utils.load_records(cfg.test_dir / "test_source2.tsv", "S2-")
-    s3_test = io_utils.load_records(cfg.test_dir / "test_source3.tsv", "S3-")
-    log(f"  source1={len(s1_test)} source2={len(s2_test)} source3={len(s3_test)}")
+    log("Fitting feature transformers on training data only (streaming pass)...")
+    transformers = fit_transformers_streaming(country_dirs)
 
-    # ---------------- Normalize ----------------
-    log("Normalizing text...")
-    s1_train_n = blocking.add_normalized_columns(s1_train)
-    s2_train_n = blocking.add_normalized_columns(s2_train)
-    s3_train_n = blocking.add_normalized_columns(s3_train)
-    s1_test_n = blocking.add_normalized_columns(s1_test)
-    s2_test_n = blocking.add_normalized_columns(s2_test)
-    s3_test_n = blocking.add_normalized_columns(s3_test)
+    X_train_parts, X_val_parts = [], []
+    gt_sets: Dict[str, Set[str]] = {}
+    val_ids_all: List[str] = []
+    total_candidate_pairs = 0
+    total_found = 0
+    total_true = 0
+    total_s1 = 0
+    total_s2 = 0
+    total_s3 = 0
 
-    # ---------------- Candidate generation (train) ----------------
-    log("Generating TRAIN candidates (blocking)...")
-    train_candidates = generate_candidates_all_countries(s1_train_n, s2_train_n, s3_train_n, cfg)
-    n_pairs_train = sum(len(v) for v in train_candidates.values())
-    log(f"  train candidate pairs: {n_pairs_train} across {len(train_candidates)} source1 entities")
+    for cdir in country_dirs:
+        country = cdir.name
+        log(f"  [{country}] loading...")
+        s1_path = cdir / "train_source1.tsv"
+        if not s1_path.exists():
+            continue
+        s1 = io_utils.load_records(s1_path, "S1-")
+        s2 = io_utils.load_records(cdir / "train_source2.tsv", "S2-") if (cdir / "train_source2.tsv").exists() else pd.DataFrame(columns=io_utils.REQUIRED_RECORD_COLUMNS)
+        s3 = io_utils.load_records(cdir / "train_source3.tsv", "S3-") if (cdir / "train_source3.tsv").exists() else pd.DataFrame(columns=io_utils.REQUIRED_RECORD_COLUMNS)
+        gt_path = cdir / "train_ground_truth.tsv"
+        gt = io_utils.load_ground_truth(gt_path) if gt_path.exists() else {}
+        total_s1 += len(s1); total_s2 += len(s2); total_s3 += len(s3)
+        log(f"  [{country}] s1={len(s1)} s2={len(s2)} s3={len(s3)} gt_rows={len(gt)}")
 
-    rec, found, total_true = evaluation.candidate_recall(train_candidates, ground_truth)
-    log(f"  candidate recall on TRAIN ground truth: {rec:.4f} ({found}/{total_true})")
-    possible_pairs = len(s1_train_n) * (len(s2_train_n) + len(s3_train_n))
-    reduction_ratio = 1 - (n_pairs_train / possible_pairs) if possible_pairs else 0.0
-    log(f"  candidate reduction ratio: {reduction_ratio:.6f}")
+        s1n = blocking.add_normalized_columns(s1)
+        s2n = blocking.add_normalized_columns(s2)
+        s3n = blocking.add_normalized_columns(s3)
+        del s1, s2, s3
 
-    # ---------------- Labels + split ----------------
-    log("Building pairwise labels and entity-level train/val split...")
-    labels = evaluation.build_pairwise_labels(train_candidates, ground_truth)
-    s1_ids_with_candidates = list(train_candidates.keys())
-    train_ids, val_ids = evaluation.group_split(s1_ids_with_candidates, cfg.val_fraction, cfg.random_seed)
-    train_ids_set, val_ids_set = set(train_ids), set(val_ids)
+        candidates = _country_candidates(s1n, s2n, s3n, cfg)
+        n_pairs = sum(len(v) for v in candidates.values())
+        total_candidate_pairs += n_pairs
+        rec, found, tot = evaluation.candidate_recall(candidates, gt)
+        total_found += found
+        total_true += tot
+        log(f"  [{country}] candidates={n_pairs} recall={rec:.4f} ({found}/{tot})")
 
-    labels_train = labels[labels["s1_id"].isin(train_ids_set)]
-    labels_val = labels[labels["s1_id"].isin(val_ids_set)]
-    log(f"  train entities={len(train_ids)} val entities={len(val_ids)} "
-        f"train_pairs={len(labels_train)} val_pairs={len(labels_val)} "
-        f"positives_total={int(labels['label'].sum())}")
+        gt_sets.update({k: set(v) for k, v in gt.items()})
 
-    # ---------------- Fit feature transformers (TRAIN ONLY) ----------------
-    log("Fitting feature transformers on training data only...")
-    corpus = pd.concat(
-        [s1_train_n[["name_norm", "addr_norm"]], s2_train_n[["name_norm", "addr_norm"]],
-         s3_train_n[["name_norm", "addr_norm"]]],
-        ignore_index=True,
-    )
-    transformers = fit_feature_transformers(corpus)
+        labels = evaluation.build_pairwise_labels(candidates, gt)
+        s1_ids = list(candidates.keys())
+        tr_ids, va_ids = evaluation.group_split(s1_ids, cfg.val_fraction, cfg.random_seed)
+        tr_set, va_set = set(tr_ids), set(va_ids)
+        val_ids_all.extend(va_ids)
 
-    # combined candidate-side lookup tables (source2 + source3 share entity_id namespace)
-    cand_train_n = pd.concat([s2_train_n, s3_train_n], ignore_index=True)
-    cand_test_n = pd.concat([s2_test_n, s3_test_n], ignore_index=True)
+        labels_tr = labels[labels["s1_id"].isin(tr_set)]
+        labels_va = labels[labels["s1_id"].isin(va_set)]
+        del labels, candidates
 
-    # ---------------- Feature computation (train/val) ----------------
-    log("Computing features for train/val pairs...")
-    from .features import compute_features_parallel
+        cand_n = pd.concat([s2n, s3n], ignore_index=True)
+        if not labels_tr.empty:
+            X_tr = compute_features_parallel(
+                labels_tr[["s1_id", "cand_id"]], s1n, cand_n, transformers, cfg.n_jobs, cfg.feature_chunk_size
+            )
+            X_tr = X_tr.merge(labels_tr[["s1_id", "cand_id", "label"]], on=["s1_id", "cand_id"])
+            X_train_parts.append(X_tr)
+        if not labels_va.empty:
+            X_va = compute_features_parallel(
+                labels_va[["s1_id", "cand_id"]], s1n, cand_n, transformers, cfg.n_jobs, cfg.feature_chunk_size
+            )
+            X_va = X_va.merge(labels_va[["s1_id", "cand_id", "label"]], on=["s1_id", "cand_id"])
+            X_val_parts.append(X_va)
 
-    pairs_train = labels_train[["s1_id", "cand_id"]]
-    pairs_val = labels_val[["s1_id", "cand_id"]]
-    X_train = compute_features_parallel(
-        pairs_train, s1_train_n, cand_train_n, transformers, cfg.n_jobs, cfg.feature_chunk_size
-    )
-    X_val = compute_features_parallel(
-        pairs_val, s1_train_n, cand_train_n, transformers, cfg.n_jobs, cfg.feature_chunk_size
-    )
-    y_train = labels_train["label"].to_numpy()
-    y_val = labels_val["label"].to_numpy()
-    X_train = X_train.merge(labels_train[["s1_id", "cand_id", "label"]], on=["s1_id", "cand_id"])
-    X_val = X_val.merge(labels_val[["s1_id", "cand_id", "label"]], on=["s1_id", "cand_id"])
+        del s1n, s2n, s3n, cand_n, labels_tr, labels_va
+        gc.collect()
 
-    # ---------------- Train (initial) + tune threshold on val ----------------
+    log(f"TOTAL across countries: s1={total_s1} s2={total_s2} s3={total_s3} "
+        f"candidate_pairs={total_candidate_pairs}")
+    rec_overall = total_found / total_true if total_true else 1.0
+    possible_pairs = total_s1 * (total_s2 + total_s3)
+    reduction_ratio = 1 - (total_candidate_pairs / possible_pairs) if possible_pairs else 0.0
+    log(f"  overall candidate recall: {rec_overall:.4f} ({total_found}/{total_true})")
+    log(f"  overall candidate reduction ratio: {reduction_ratio:.6f}")
+
+    X_train = pd.concat(X_train_parts, ignore_index=True) if X_train_parts else pd.DataFrame()
+    X_val = pd.concat(X_val_parts, ignore_index=True) if X_val_parts else pd.DataFrame()
+    del X_train_parts, X_val_parts
+    gc.collect()
+    log(f"  final train_pairs={len(X_train)} val_pairs={len(X_val)} "
+        f"positives_train={int(X_train['label'].sum()) if len(X_train) else 0}")
+
     log("Training model on TRAIN split...")
     clf = model_mod.train_model(X_train, X_train["label"].to_numpy(), cfg.random_seed)
 
     log("Scoring VAL split and tuning threshold for macro F0.5...")
     val_scored = X_val[["s1_id", "cand_id"]].copy()
     val_scored["score"] = model_mod.predict_proba(clf, X_val)
-    gt_sets = {k: set(v) for k, v in ground_truth.items()}
 
     if cfg.fixed_threshold is not None:
         best_threshold = cfg.fixed_threshold
         threshold_table = pd.DataFrame([{"threshold": best_threshold, "note": "fixed by user"}])
     else:
         best_threshold, threshold_table = evaluation.tune_threshold(
-            val_scored, gt_sets, val_ids, cfg.thresholds
+            val_scored, gt_sets, val_ids_all, cfg.thresholds
         )
     log(f"  best threshold = {best_threshold}")
 
     val_preds = evaluation.predictions_from_scores(val_scored, best_threshold)
-    val_metrics = evaluation.macro_f_beta(val_preds, gt_sets, val_ids, beta=0.5)
-    singleton_metrics = evaluation.singleton_performance(val_preds, gt_sets, val_ids)
+    val_metrics = evaluation.macro_f_beta(val_preds, gt_sets, val_ids_all, beta=0.5)
+    singleton_metrics = evaluation.singleton_performance(val_preds, gt_sets, val_ids_all)
     log(f"  VAL metrics: {val_metrics}")
     log(f"  VAL singleton metrics: {singleton_metrics}")
 
-    # ---------------- Retrain on ALL labeled train data with tuned threshold ----------------
     log("Retraining final model on all labeled train+val pairs...")
     X_all = pd.concat([X_train, X_val], ignore_index=True)
     final_clf = model_mod.train_model(X_all, X_all["label"].to_numpy(), cfg.random_seed)
+    del X_train, X_val, X_all
+    gc.collect()
 
-    model_mod.save_model(final_clf, transformers, cfg.models_dir / "model.joblib")
+    cfg.models_dir.mkdir(parents=True, exist_ok=True)
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+    bundle = {"model": final_clf, "transformers": transformers, "threshold": best_threshold}
+    joblib.dump(bundle, cfg.models_dir / "model_bundle.joblib")
+    log(f"  Saved model bundle to {cfg.models_dir / 'model_bundle.joblib'}")
 
-    # ---------------- Candidate generation (test) ----------------
-    log("Generating TEST candidates (blocking)...")
-    test_candidates = generate_candidates_all_countries(s1_test_n, s2_test_n, s3_test_n, cfg)
-    n_pairs_test = sum(len(v) for v in test_candidates.values())
-    log(f"  test candidate pairs: {n_pairs_test} across {len(test_candidates)} source1 entities")
+    train_report = {
+        "best_threshold": best_threshold,
+        "val_metrics": val_metrics,
+        "val_singleton_metrics": singleton_metrics,
+        "train_candidate_recall": rec_overall,
+        "train_candidate_reduction_ratio": reduction_ratio,
+        "n_train_candidate_pairs": total_candidate_pairs,
+    }
+    (cfg.reports_dir / "train_metrics.json").write_text(json.dumps(train_report, indent=2, default=str))
+    threshold_table.to_csv(cfg.reports_dir / "threshold_tuning.tsv", sep="\t", index=False)
+    log("=== TRAIN PHASE DONE ===")
+    log(json.dumps(train_report, indent=2, default=str))
+    return bundle
 
-    s1_test_order = s1_test["entity_id"].tolist()
-    io_utils.write_candidate_pairs(cfg.output_dir / "candidate_pairs.tsv", test_candidates, s1_test_order)
 
-    # ---------------- Score + predict test ----------------
-    log("Scoring TEST candidates...")
-    test_scored = predict.score_candidates(
-        test_candidates, s1_test_n, cand_test_n, final_clf, transformers,
-        n_jobs=cfg.n_jobs, chunk_size=cfg.feature_chunk_size,
-    )
-    test_matches = predict.apply_threshold(test_scored, best_threshold, s1_test_order)
-    io_utils.write_matching_results(cfg.output_dir / "matching_results.tsv", test_matches, s1_test_order)
+# --------------------------------------------------------------------------
+# PREDICT PHASE -- same per-country streaming, scores against the saved
+# model bundle, writes outputs in the ORIGINAL test_source1.tsv row order.
+# --------------------------------------------------------------------------
+def run_predict_phase(cfg: Config, bundle: Optional[dict] = None) -> dict:
+    log("=== PREDICT PHASE ===")
+    if bundle is None:
+        bundle_path = cfg.models_dir / "model_bundle.joblib"
+        log(f"Loading model bundle from {bundle_path}...")
+        bundle = joblib.load(bundle_path)
+    final_clf = bundle["model"]
+    transformers = bundle["transformers"]
+    best_threshold = bundle["threshold"]
 
-    # ---------------- Validate ----------------
+    log("Partitioning test data by country (streamed, cached on disk)...")
+    partition.partition_test_dir(cfg.test_dir, cfg.partitioned_test_dir, force=cfg.force_repartition)
+    country_dirs = partition.list_country_dirs(cfg.partitioned_test_dir)
+    log(f"  countries found: {[d.name for d in country_dirs]}")
+
+    candidates_all: Dict[str, List[str]] = {}
+    matches_all: Dict[str, List[str]] = {}
+    total_candidate_pairs = 0
+
+    for cdir in country_dirs:
+        country = cdir.name
+        s1_path = cdir / "test_source1.tsv"
+        if not s1_path.exists():
+            continue
+        log(f"  [{country}] loading...")
+        s1 = io_utils.load_records(s1_path, "S1-")
+        s2 = io_utils.load_records(cdir / "test_source2.tsv", "S2-") if (cdir / "test_source2.tsv").exists() else pd.DataFrame(columns=io_utils.REQUIRED_RECORD_COLUMNS)
+        s3 = io_utils.load_records(cdir / "test_source3.tsv", "S3-") if (cdir / "test_source3.tsv").exists() else pd.DataFrame(columns=io_utils.REQUIRED_RECORD_COLUMNS)
+        log(f"  [{country}] s1={len(s1)} s2={len(s2)} s3={len(s3)}")
+
+        s1n = blocking.add_normalized_columns(s1)
+        s2n = blocking.add_normalized_columns(s2)
+        s3n = blocking.add_normalized_columns(s3)
+        del s1, s2, s3
+
+        candidates = _country_candidates(s1n, s2n, s3n, cfg)
+        n_pairs = sum(len(v) for v in candidates.values())
+        total_candidate_pairs += n_pairs
+        log(f"  [{country}] candidates={n_pairs}")
+        candidates_all.update(candidates)
+
+        cand_n = pd.concat([s2n, s3n], ignore_index=True)
+        scored = predict.score_candidates(
+            candidates, s1n, cand_n, final_clf, transformers,
+            n_jobs=cfg.n_jobs, chunk_size=cfg.feature_chunk_size,
+        )
+        country_matches = predict.apply_threshold(scored, best_threshold, list(candidates.keys()))
+        matches_all.update(country_matches)
+
+        del s1n, s2n, s3n, cand_n, candidates, scored, country_matches
+        gc.collect()
+
+    log("Determining original test source1 row order...")
+    s1_order = pd.read_csv(
+        cfg.test_dir / "test_source1.tsv", sep="\t", dtype=str, keep_default_na=False,
+        usecols=["entity_id"],
+    )["entity_id"].tolist()
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    io_utils.write_candidate_pairs(cfg.output_dir / "candidate_pairs.tsv", candidates_all, s1_order)
+    io_utils.write_matching_results(cfg.output_dir / "matching_results.tsv", matches_all, s1_order)
+    del candidates_all
+    gc.collect()
+
     validate_outputs(
-        cfg.output_dir / "matching_results.tsv", cfg.output_dir / "candidate_pairs.tsv", s1_test_order
+        cfg.output_dir / "matching_results.tsv", cfg.output_dir / "candidate_pairs.tsv", s1_order
     )
 
     validator_script = Path("utils/validate_submission.py")
@@ -270,27 +353,38 @@ def main(argv=None):
     else:
         validator_passed = None
 
-    # ---------------- Report ----------------
-    n_matched_test = sum(1 for v in test_matches.values() if v)
-    report = {
-        "best_threshold": best_threshold,
-        "val_metrics": val_metrics,
-        "val_singleton_metrics": singleton_metrics,
-        "train_candidate_recall": rec,
-        "train_candidate_reduction_ratio": reduction_ratio,
-        "n_train_candidate_pairs": n_pairs_train,
-        "n_test_candidate_pairs": n_pairs_test,
-        "n_test_source1_entities": len(s1_test_order),
+    n_matched_test = sum(1 for v in matches_all.values() if v)
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+    predict_report = {
+        "threshold_used": best_threshold,
+        "n_test_candidate_pairs": total_candidate_pairs,
+        "n_test_source1_entities": len(s1_order),
         "n_test_entities_with_a_match": n_matched_test,
         "validator_passed": validator_passed,
-        "elapsed_seconds": round(time.time() - t0, 1),
     }
-    (cfg.reports_dir / "validation_metrics.json").write_text(json.dumps(report, indent=2, default=str))
-    threshold_table.to_csv(cfg.reports_dir / "threshold_tuning.tsv", sep="\t", index=False)
+    (cfg.reports_dir / "predict_metrics.json").write_text(json.dumps(predict_report, indent=2, default=str))
+    log("=== PREDICT PHASE DONE ===")
+    log(json.dumps(predict_report, indent=2, default=str))
+    return predict_report
 
-    log("DONE.")
-    log(json.dumps(report, indent=2, default=str))
-    return report
+
+def main(argv=None):
+    t0 = time.time()
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    cfg = config_from_args(args)
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.models_dir.mkdir(parents=True, exist_ok=True)
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    bundle = None
+    if cfg.phase in ("train", "all"):
+        bundle = run_train_phase(cfg)
+    if cfg.phase in ("predict", "all"):
+        run_predict_phase(cfg, bundle)
+
+    log(f"Total elapsed: {round(time.time() - t0, 1)}s")
 
 
 if __name__ == "__main__":

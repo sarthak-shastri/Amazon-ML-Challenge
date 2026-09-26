@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -31,7 +31,13 @@ class Config:
         default_factory=lambda: [round(0.05 * i, 2) for i in range(4, 20)]
     )
     # Optional fixed threshold override (skips tuning if set, e.g. via --prediction-threshold)
-    fixed_threshold: float | None = None
+    fixed_threshold: Optional[float] = None
+
+    # Memory-safe per-country streaming
+    phase: str = "all"                        # "train", "predict", or "all"
+    partitioned_train_dir: Optional[Path] = None  # default: <train_dir>_by_country
+    partitioned_test_dir: Optional[Path] = None   # default: <test_dir>_by_country
+    force_repartition: bool = False
 
     def __post_init__(self):
         self.train_dir = Path(self.train_dir)
@@ -39,6 +45,14 @@ class Config:
         self.output_dir = Path(self.output_dir)
         self.models_dir = Path(self.models_dir)
         self.reports_dir = Path(self.reports_dir)
+        if self.partitioned_train_dir is None:
+            self.partitioned_train_dir = self.train_dir.parent / f"{self.train_dir.name}_by_country"
+        else:
+            self.partitioned_train_dir = Path(self.partitioned_train_dir)
+        if self.partitioned_test_dir is None:
+            self.partitioned_test_dir = self.test_dir.parent / f"{self.test_dir.name}_by_country"
+        else:
+            self.partitioned_test_dir = Path(self.partitioned_test_dir)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -58,6 +72,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Parallel workers for blocking/feature computation. -1 = all cores.")
     p.add_argument("--feature-chunk-size", type=int, default=200_000,
                     help="Pairs per chunk when parallelizing feature computation.")
+    p.add_argument("--phase", type=str, choices=["train", "predict", "all"], default="all",
+                    help="Run only training, only prediction (loads a saved model bundle), or both.")
+    p.add_argument("--partitioned-train-dir", type=str, default=None,
+                    help="Where to write/read per-country train partitions. Default: <train-dir>_by_country")
+    p.add_argument("--partitioned-test-dir", type=str, default=None,
+                    help="Where to write/read per-country test partitions. Default: <test-dir>_by_country")
+    p.add_argument("--force-repartition", action="store_true",
+                    help="Delete and rebuild the per-country partition cache even if it already exists.")
     return p
 
 
@@ -72,8 +94,12 @@ def config_from_args(args: argparse.Namespace) -> Config:
         val_fraction=args.val_fraction,
         n_neighbors=args.n_neighbors,
         max_candidates=args.max_candidates,
+        partitioned_train_dir=args.partitioned_train_dir,
+        partitioned_test_dir=args.partitioned_test_dir,
     )
     cfg.fixed_threshold = args.prediction_threshold
     cfg.n_jobs = args.n_jobs
     cfg.feature_chunk_size = args.feature_chunk_size
+    cfg.phase = args.phase
+    cfg.force_repartition = args.force_repartition
     return cfg
