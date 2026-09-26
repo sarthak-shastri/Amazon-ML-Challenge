@@ -1,0 +1,107 @@
+================================================================================
+BUSINESS ENTITY RESOLUTION: DATA PREPROCESSING & ML PIPELINE STRATEGY
+================================================================================
+
+1. ROBUST MISSING VALUE & TYPE HANDLING (PREVENTING RUNTIME CRASHES)
+--------------------------------------------------------------------------------
+- Missing Address Imputation: ~2.6% to 3.4% of records in Source 2 and Source 3
+  have missing addresses (NaN). Missing addresses must be filled with an empty
+  string "" or "<EMPTY_ADDR>" to avoid downstream string processing errors.
+- Strict Type Coercion: Enforce string types on all text fields during TSV ingestion
+  (dtype=str, keep_default_na=False) to prevent pandas from interpreting missing
+  values or numeric names as floats/integers.
+- Missing Address Indicator Flag: Create a binary feature (is_address_missing = 1/0)
+  so tree models can dynamically adjust weights between name similarity and
+  address similarity.
+
+2. TEXT NORMALIZATION & NOISE CLEANING
+--------------------------------------------------------------------------------
+- Unicode NFKC Normalization: Use unicodedata.normalize('NFKC', text) to normalize
+  accents (critical for French records in the test set: é, à, è, ç) and standard
+  ligatures.
+- Noise Stripping: Remove leading/trailing non-alphanumeric punctuation artifacts
+  (e.g., "<< Team Ecole" -> "Team Ecole", "-- Holloway Peak Inc" -> "Holloway Peak Inc").
+- Whitespace Harmonization: Collapse multiple spaces, tabs, and newline escapes
+  into clean single whitespace.
+- Domain & URL Cleaning: Strip web domain suffixes (.com, .org, .in, www.) from
+  names (e.g., "wilfordhancock.com" -> "wilford hancock").
+
+3. BUSINESS NAME & LEGAL SUFFIX HARMONIZATION
+--------------------------------------------------------------------------------
+- Legal Suffix Extraction: Extract country-specific corporate entity forms:
+  * US: Inc, Incorporated, LLC, Corp, Corporation, Co, Ltd
+  * India: Pvt Ltd, Private Limited, Ltd, LLP, Enterprises
+  * France: SARL, SAS, SCI, EURL, SA, Groupe, Amicale
+- Base Name Cleaning: Produce clean_name by stripping legal suffixes so core
+  brand names can be directly compared without suffix noise.
+- Suffix Feature: Record legal suffix similarity as a separate feature
+  (e.g., suffix_match_flag = 1, 0, or -1 if unknown).
+
+4. CROSS-SCRIPT & MULTILINGUAL ALIGNMENT (DEVANAGARI & LATIN)
+--------------------------------------------------------------------------------
+- Script Detection: Detect Devanagari Unicode block (\u0900-\u097F) in Indian records.
+- Phonetic / Script Transliteration: Use rule-based or phonetic transliteration
+  mapping from Devanagari to Latin characters so Hindi names (e.g., राम मार्केटिंग)
+  can be matched against English transliterations (Ram Marketing).
+- Character N-Gram Overlap: Compute character 3-gram and 4-gram Jaccard/Dice
+  similarities, which remain robust against spelling and transliteration shifts.
+
+5. ADDRESS PARSING & KEY ENTITY EXTRACTION
+--------------------------------------------------------------------------------
+- Postal / PIN Code Extraction: Regex-extract postal codes:
+  * 5-digit US ZIP codes
+  * 6-digit Indian PIN codes
+  * 5-digit French postal codes
+  Exact postal code matches provide strong discriminatory power.
+- Street / Building Number Extraction: Extract house numbers, plot numbers,
+  and municipal indicators (e.g., "KH NO. -570/13", "1795").
+- Address Term Normalization: Standardize common abbreviations:
+  * Rd -> Road, St -> Street, Ave -> Avenue, Blvd/Bd -> Boulevard
+  * R. -> Rue, Sq -> Square, Apt -> Apartment.
+
+6. BLOCKING & CANDIDATE GENERATION (ESSENTIAL FOR SCALE)
+--------------------------------------------------------------------------------
+- Country Partitioning: Enforce strict partition by country. US entities only
+  match US candidates; India matches India; France matches France.
+- Inverted Index / Token Blocking: Build an inverted index over cleaned name
+  tokens, character 3-grams, and postal codes.
+- High Recall Candidate Selection: Retrieve Top-K (e.g., K = 20 to 30) candidates
+  per Source 1 entity. The candidate set represents candidate_pairs.tsv and
+  establishes the recall ceiling (>95% target recall).
+
+7. TRAINING PAIR GENERATION (HARD NEGATIVE MINING)
+--------------------------------------------------------------------------------
+- Positive Pairs: Ground truth mappings (source1_entity_id -> matched_entity_ids).
+- Hard Negative Mining: Select non-matching candidate pairs returned by the
+  blocking stage (entities sharing the same city or having high lexical name
+  similarity but differing in ground truth).
+- Balanced Sampling: Maintain a realistic positive-to-negative ratio (e.g., 1:5
+  or 1:10) for training gradient boosted decision trees (LightGBM/XGBoost/CatBoost).
+
+8. FEATURE ENGINEERING FOR PAIRWISE MATCHING
+--------------------------------------------------------------------------------
+- String Similarity Metrics:
+  * Levenshtein ratio, Jaro-Winkler (typo tolerance)
+  * Token Sort Ratio, Token Set Ratio (word reordering)
+  * Character 3-gram Jaccard similarity
+- Address Similarities:
+  * Address token Jaccard similarity
+  * Building/street number match flag
+  * Postal code exact match / prefix match flag
+- Structural / Meta Features:
+  * Name length difference, token count ratio
+  * Legal suffix compatibility flag
+  * Missing address indicator
+
+9. VALIDATION SETUP & F0.5 THRESHOLD OPTIMIZATION
+--------------------------------------------------------------------------------
+- Entity-Level Stratified Validation: Split Source 1 training records into
+  80% Train and 20% Validation by entity ID to prevent data leakage.
+- Macro-Average F0.5 Scoring: Implement the competition metric:
+  F_0.5 = (1.25 * Precision * Recall) / (0.25 * Precision + Recall)
+  calculated per Source 1 entity and macro-averaged across the dataset.
+- Singleton Guard & Threshold Tuning: Singletons (0 true matches, 5.58% of data)
+  score 1.0 on empty prediction and 0.0 on any false match. Because F0.5 rewards
+  precision 2x over recall, tune decision thresholds conservatively
+  (e.g., threshold >= 0.65 - 0.75) to minimize false positive merges.
+================================================================================
