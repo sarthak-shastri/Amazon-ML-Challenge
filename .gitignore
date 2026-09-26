@@ -169,3 +169,6 @@ models/*.pth
 output/
 output_small/
 reports/
+
+run_log.txt
+*.log
